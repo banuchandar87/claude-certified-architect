@@ -11,7 +11,7 @@ VERSION_TEX="$TMP_DIR/version.tex"
 PDF_OUT="$DIST_DIR/claude-architect-exam-guide.pdf"
 EPUB_OUT="$DIST_DIR/claude-architect-exam-guide.epub"
 COVER_IMAGE="$ROOT_DIR/publishing/cover.svg"
-REPOSITORY_URL="https://github.com/daronyondem/claude-architect-exam-guide"
+REPOSITORY_URL="https://github.com/banuchandar87/claude-certified-architect"
 
 mkdir -p "$TMP_DIR"
 
@@ -42,7 +42,7 @@ cat > "$EPUB_SOURCE" <<EOF
 
 <p class="book-subtitle">Exam Preparation Guide</p>
 <p class="book-version">Version: $BOOK_VERSION</p>
-<p class="book-author">Daron Yondem</p>
+<p class="book-author">Banuchandar Ganesan</p>
 <p class="book-updates"><a href="$REPOSITORY_URL">Repository and updates</a></p>
 
 EOF

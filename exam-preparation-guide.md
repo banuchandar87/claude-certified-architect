@@ -12,6 +12,21 @@ The most important habit is to ask: where should responsibility live?
 
 This guide avoids exam-question content. The examples are original teaching examples that illustrate the underlying concepts.
 
+### How to read the code in this guide
+
+Code samples are Python, using the official `anthropic` SDK for API work and `claude_agent_sdk` for agent work. They are teaching illustrations, not copy-paste production code: error handling and retries are usually elided to keep the concept visible. Model identifiers (`claude-sonnet-5`, `claude-opus-5`, `claude-haiku-4-5-20251001`) are the current strings at the time of writing and are the single most volatile detail in any sample — read them as "a mid-tier model," "a top-tier model," "a fast cheap model," and confirm the current lineup in the models documentation rather than memorizing IDs.
+
+### Revision notes (August 2026)
+
+This revision folded in a documentation-verification pass. Changes worth knowing about if you studied an earlier copy:
+
+- The model-tier table now notes that the lineup extends **above Opus** (the Mythos-class tier, including Claude Mythos 5 and Claude Fable 5). A three-row Haiku/Sonnet/Opus mental model is no longer complete.
+- The structured-outputs-versus-citations claim in the extraction section is now explained *mechanically* rather than asserted, and a Citations subsection was added.
+- New material was added for gaps that the reading list implied but the body never taught: multimodal inputs, the Files API, the Citations API, long-context operation, MCP authorization, Agent SDK permission modes and the `can_use_tool` callback, headless/CI execution, plugins, interleaved thinking and the thinking-block preservation rule, data retention, and consolidated token-cost mechanics.
+- Several sections that stated a pattern abstractly now show it in code: preview-then-execute tokens, context editing and compaction configuration, batch submission and reconciliation, and adaptive thinking with effort.
+
+Verified as current during that pass and unchanged: `output_config.format` as the structured-outputs parameter, prefill rejection on Claude 4.6 and later, MCP scope precedence (local > project > user, winning entry used whole), the 24-hour batch window with `custom_id` correlation and ~50% discount, and adaptive thinking with `effort` superseding fixed `budget_tokens`.
+
 ---
 
 ## 1. API Fundamentals and Output Control
@@ -53,6 +68,116 @@ For exam-style architecture questions, the key principle is stable: schema-backe
 
 When multiple tools are available but one must run first, use `tool_choice` with a specific tool name (e.g., `{"type": "tool", "name": "extract_metadata"}`) for the first call, receive the structured result, then make subsequent calls for enrichment. Reordering tool definitions or relying on system prompt priority is unreliable.
 
+### The Request in Code
+
+The whole mechanism is small enough to hold in your head, and the shape of the request is what most architecture questions are really about — where each piece of responsibility lives.
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()   # reads ANTHROPIC_API_KEY from the environment
+
+extract_metadata = {
+    "name": "extract_metadata",
+    "description": (
+        "Record the document type and issue date for a scanned business document. "
+        "Call this first, before any enrichment tool, so downstream steps have a "
+        "document_type to branch on. Do not call it for free-form correspondence."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "document_type": {
+                "type": "string",
+                "enum": ["invoice", "contract", "purchase_order", "other"],
+            },
+            "issue_date": {
+                "type": ["string", "null"],
+                "description": "ISO 8601 date, or null when the document does not state one.",
+            },
+        },
+        "required": ["document_type", "issue_date"],
+    },
+}
+
+response = client.messages.create(
+    model="claude-sonnet-5",
+    max_tokens=1024,
+    system="You classify business documents. Extract only what the document states.",
+    tools=[extract_metadata],
+    tool_choice={"type": "tool", "name": "extract_metadata"},   # guaranteed tool call
+    messages=[{"role": "user", "content": document_text}],
+)
+
+metadata = next(b.input for b in response.content if b.type == "tool_use")
+```
+
+Three things to notice, because each maps to a design principle rather than a syntax detail:
+
+- `system` is a **top-level parameter**, not a message. There is no `{"role": "system"}` turn.
+- `response.content` is a **list of blocks**, not a string. An assistant turn may mix `text`, `tool_use`, and `thinking` blocks, so code that reads `response.content[0].text` breaks the moment the model calls a tool.
+- Nothing here executed a tool. `tool_use` is a *request* from the model; your application runs the function and returns the outcome as a `tool_result` block in the next user turn. The model never touches your systems directly — that boundary is the reason tool-level enforcement works at all.
+
+Continuing the loop after running the tool:
+
+```python
+messages = [
+    {"role": "user", "content": document_text},
+    {"role": "assistant", "content": response.content},   # echo the model's turn back verbatim
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": tool_use_block.id,
+                "content": json.dumps(enrichment_result),
+            }
+        ],
+    },
+]
+```
+
+Echoing the assistant turn back *verbatim* matters more than it looks: if the turn contained `thinking` blocks, they must be returned unmodified or the API rejects the request (see the Thinking and Effort section).
+
+### Structured Outputs in Code
+
+The same extraction, expressed as a constrained JSON response rather than a tool call:
+
+```python
+maintenance_schema = {
+    "type": "object",
+    "properties": {
+        "site_name": {"type": "string"},
+        "reported_by": {"type": ["string", "null"]},
+        "observed_issues": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["site_name", "reported_by", "observed_issues"],
+    "additionalProperties": False,
+}
+
+response = client.messages.create(
+    model="claude-sonnet-5",
+    max_tokens=2048,
+    output_config={"format": {"type": "json_schema", "schema": maintenance_schema}},
+    messages=[{"role": "user", "content": f"Extract fields from:\n{report_text}"}],
+)
+
+record = json.loads(response.content[0].text)   # conforms to the schema by construction
+```
+
+Strict tool use is the same guarantee applied to a tool's `input_schema` instead of the response body:
+
+```python
+tools = [{
+    "name": "extract_maintenance_report",
+    "description": "Record a structured maintenance report.",
+    "input_schema": maintenance_schema,
+    "strict": True,           # schema compliance enforced, not merely requested
+}]
+```
+
+Choose by asking what the structured object *is*. If it is the answer the caller consumes, constrain the response (`output_config.format`). If it is an action inside an agent loop — an extraction step, a function call, a stage output feeding the next stage — model it as a tool. They compose in one request when an agent must both call tools correctly and return a structured final answer.
+
 For extraction systems, common patterns are:
 
 1. Use `output_config.format` with a JSON Schema when you want the response body to be validated JSON.
@@ -64,6 +189,77 @@ For extraction systems, common patterns are:
 Tool definitions, tool schemas, output schemas, and tool-use/result blocks count as input tokens or add injected prompt overhead. A large schema (for example, a 12-field tool definition with detailed descriptions consuming ~2,500 tokens) combined with a long document can approach the context limit. When that happens, accuracy degrades on content near the end of the document because the model is processing close to the effective attention boundary. The root cause is total context consumption, not a model defect.
 
 Structured outputs also have operational implications: the first request for a schema may have additional latency while the grammar is compiled; schemas are cached for reuse; very complex schemas can exceed compilation limits; refusals or max-token stops can still produce nonconforming output. Do not treat schema compliance as a substitute for domain validation.
+
+### Multimodal Inputs
+
+Message content is not limited to text. A user turn can carry image and document blocks alongside text, which matters architecturally because it changes what "extraction" means: a scanned invoice does not need an OCR stage bolted in front of the model.
+
+```python
+import base64
+
+with open("invoice_scan.png", "rb") as f:
+    image_b64 = base64.standard_b64encode(f.read()).decode()
+
+response = client.messages.create(
+    model="claude-sonnet-5",
+    max_tokens=2048,
+    messages=[{
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": image_b64},
+            },
+            {"type": "text", "text": "Extract the line items and the stated total."},
+        ],
+    }],
+)
+```
+
+PDFs use a `document` block instead, and the model reads both the text layer and the page images, which is why a PDF costs meaningfully more input tokens than the same content pasted as plain text.
+
+```python
+with open("contract.pdf", "rb") as f:
+    pdf_b64 = base64.standard_b64encode(f.read()).decode()
+
+content = [
+    {
+        "type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64},
+    },
+    {"type": "text", "text": "What is the termination notice period?"},
+]
+```
+
+Architecture implications worth carrying into a scenario question:
+
+- **Images consume input tokens proportional to their dimensions.** A pipeline that attaches four full-resolution page scans per request is making a token-budget decision, whether or not anyone noticed. Downscale to the smallest size at which the text is legible.
+- **Put the image or document before the text instruction** in the content list. Instructions read after the evidence produce better grounding than instructions the model has already read before seeing anything.
+- **Multimodal inputs interact with every other lever in this guide.** They enlarge the cached prefix if a document is shared across requests (good — cache it), they enlarge each batch request, and they push long documents toward the context limits discussed in the Context Management section.
+
+### The Files API
+
+Base64-inlining the same document into fifty requests re-uploads it fifty times. The Files API lets you upload once and reference the stored object by identifier afterwards.
+
+```python
+uploaded = client.beta.files.upload(
+    file=("policy_manual.pdf", open("policy_manual.pdf", "rb"), "application/pdf"),
+)
+
+response = client.messages.create(
+    model="claude-sonnet-5",
+    max_tokens=1024,
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "document", "source": {"type": "file", "file_id": uploaded.id}},
+            {"type": "text", "text": "Summarize the escalation policy."},
+        ],
+    }],
+)
+```
+
+The architectural point is not the convenience. It is that a `file_id` is a **stable reference**, which makes it a good citizen of every other mechanism: it keeps request payloads small (helping rate limits measured in bytes and tokens on the wire), it makes a shared document prefix trivially identical across requests (helping prompt caching), and it is the practical way to run a large document through many batch requests without embedding megabytes of base64 in every one. It does not reduce input token count — the model still processes the document — so it is a transport and ergonomics lever, not a cost lever. Do not confuse the two in a cost-optimization question.
 
 ### Partial Assistant Prefill (Legacy)
 
@@ -79,6 +275,30 @@ Use the modern replacements:
 | Continuing an interrupted response | A user turn quoting the partial output and asking the model to continue from there |
 
 The architecture lesson is unchanged: schema-backed output beats string-steering. If a design option proposes prefill to guarantee format on a current model, prefer structured outputs or tool use.
+
+The continuation row deserves a worked example, because it is the one replacement that is not a drop-in. Prefill used to guarantee *seamless* continuation: the model's next token followed your partial string literally, so `partial + completion` concatenated cleanly. The replacement does not guarantee that.
+
+```python
+# Legacy (now a 400 on current models): trailing assistant turn as a prefill
+# messages=[{"role": "user", "content": prompt},
+#           {"role": "assistant", "content": partial_text}]
+
+# Replacement: quote the partial text in a user turn and ask for the remainder
+messages = [
+    {"role": "user", "content": prompt},
+    {"role": "assistant", "content": partial_text},
+    {
+        "role": "user",
+        "content": (
+            "That response was cut off. Continue from exactly where it stopped, "
+            "starting with the next sentence. Do not repeat any text already written "
+            "and do not re-introduce the topic."
+        ),
+    },
+]
+```
+
+The operational consequence: the model may restate a clause or add a transition, so any downstream code that blindly concatenated `partial + completion` needs a de-duplication or overlap check now. If the output must be exactly reconstructable, do not lean on continuation at all — raise `max_tokens`, stream so partial output is captured as it arrives, or split the generation into schema-bounded segments you assemble yourself.
 
 ### Token Growth in Extended Conversations
 
@@ -483,7 +703,45 @@ This is critical when:
 - Final reports need citations.
 - Human reviewers must audit the model's choices.
 
-API-level citation features can help for narrative answers over documents, but strict JSON structured outputs and citations may be incompatible because citations require interleaved citation blocks while JSON schemas require constrained JSON. When you need structured extraction plus provenance, represent source locations explicitly in your schema instead of assuming the citation feature can be attached to every JSON field.
+#### The Citations API, and why it does not simply bolt onto structured extraction
+
+The API has a native citations feature. You mark a document as citable, and the model's response comes back as an alternating sequence of text blocks, where blocks grounded in the source carry `citations` pointing at the exact spans they came from.
+
+```python
+response = client.messages.create(
+    model="claude-sonnet-5",
+    max_tokens=2048,
+    messages=[{
+        "role": "user",
+        "content": [
+            {
+                "type": "document",
+                "source": {"type": "text", "media_type": "text/plain", "data": contract_text},
+                "title": "Master Services Agreement",
+                "citations": {"enabled": True},
+            },
+            {"type": "text", "text": "What notice period applies to termination for convenience?"},
+        ],
+    }],
+)
+
+for block in response.content:
+    if block.type == "text":
+        print(block.text)
+        for citation in (getattr(block, "citations", None) or []):
+            print("   ← cited:", citation.cited_text)
+```
+
+The value is that provenance is produced by the *decoding path* rather than asked for in a prompt — the model cannot cite a span that is not in the document, which is a much stronger guarantee than instructing it to "include the source quote."
+
+Now the incompatibility, stated mechanically rather than as a rule to memorize. Citations and JSON structured outputs are two different constraints on the *same* output channel:
+
+- Citations require the response to be a **sequence of text blocks with attached citation metadata**. The block boundaries are where the grounding changes.
+- `output_config.format` requires the response text to be **one JSON document conforming to a grammar**. There is no place in that grammar for interleaved citation metadata, and splitting the JSON across annotated blocks would break the schema.
+
+So they compete for the same slot. This is why, for structured extraction that must be auditable, the durable pattern is to **model provenance as fields in your own schema** — `source_location`, `source_quote`, `effective_date` — rather than expecting citation metadata to attach to individual JSON keys. You lose the decoding-level guarantee and take on the semantic validation burden yourself: check that each `source_quote` is genuinely a substring of the source document, and reject the extraction when it is not. That check is cheap, deterministic, and recovers most of what the citations feature would have given you.
+
+The clean division of labor: citations for **narrative answers over documents** (research assistants, Q&A over a corpus, anything a human reads), schema-carried provenance for **structured records that feed systems** (extraction pipelines, databases, workflow engines).
 
 For documents with amendments, a single scalar field may be the wrong schema. Capture original and amended values with effective dates and locations. For documents with a known precedence rule, such as "use the detailed specifications table over marketing summary text," include that rule in the extraction instructions and keep the schema simple.
 
@@ -726,6 +984,38 @@ The strategies above are application-level: your code decides what to keep, summ
 - **Context editing** clears stale content — typically old tool results — from the transcript based on configurable thresholds. It prunes rather than summarizes.
 - Agentic products often build on these: Claude Code, for example, automatically compacts long sessions so work can continue.
 
+Both are **opt-in per request and threshold-driven** — that is the mechanical detail most often missed. Neither happens silently because a conversation got long; you enable them and specify when they fire.
+
+```python
+response = client.beta.messages.create(
+    model="claude-sonnet-5",
+    max_tokens=4096,
+    tools=tools,
+    messages=conversation,
+    context_management={
+        "edits": [
+            {
+                "type": "clear_tool_uses_20250919",
+                # fire only when the request approaches this input size
+                "trigger": {"type": "input_tokens", "value": 120000},
+                # always keep the most recent tool results intact
+                "keep": {"type": "tool_uses", "value": 3},
+                # leave a placeholder so the transcript stays coherent
+                "clear_tool_inputs": True,
+            }
+        ]
+    },
+)
+
+print(response.usage)   # reports what was cleared / compacted
+```
+
+Read the shape of that configuration, not the exact field names: you are declaring **a trigger** (when), **a retention floor** (what must survive), and **a replacement policy** (what the model sees in place of what was removed). Compaction is configured the same way and produces a summary block your application must pass back on the next request, exactly as it would a normal turn — the server does not hold it for you, because the API is still stateless.
+
+The reactive-versus-proactive question follows from this. Waiting for `stop_reason: "model_context_window_exceeded"` and *then* compacting works, but it costs a wasted request and a stall the user sees. Setting the trigger below the window means the pruning happens as a normal part of the conversation, before anything fails. Treat the stop reason as the **backstop**, not the trigger; if it is firing in production, your thresholds are set too high or not set at all.
+
+One consequence for the cost model: clearing or summarizing content that sits inside a cached prefix invalidates that prefix (see the Prompt Caching section). Context editing that repeatedly rewrites the middle of the conversation is at odds with caching the conversation. Design for one or the other at a given breakpoint — commonly, cache the stable system and tool prefix, and let editing operate on the volatile tail after the last breakpoint.
+
 Choosing between application-level and API-native management is itself an architecture decision:
 
 - Application-level strategies give you control and portability. You decide exactly what survives — structured state, reference sections, fact stores — and the logic works regardless of provider or model version. They are the right tool when specific facts must survive verbatim.
@@ -733,6 +1023,18 @@ Choosing between application-level and API-native management is itself an archit
 - The two compose. A production agent can maintain a structured state object (application-level) while relying on compaction to handle the long tail of conversational history.
 
 A related signal is the stop reason: if a response ends because the conversation no longer fits the model's context window, that is the trigger to compact, trim, or summarize — not to retry the same oversized request (see the stop reasons table in the Model Selection and Inference Controls section).
+
+### Long Context Windows
+
+Current models offer very large context windows, and extended-context options push further still on selected models. Treating that capacity as free is the most common architecture mistake in this area, for three separate reasons that a scenario question may test individually:
+
+- **Cost scales with what you send, every turn.** A 400,000-token conversation costs 400,000 input tokens on each request, not once. Long context and prompt caching are complementary for exactly this reason: caching is what makes a large stable prefix affordable to re-send.
+- **Extended-context modes can carry different pricing and rate-limit treatment.** Beyond a threshold, long-context requests are commonly priced at a premium tier and consume token-per-minute budget disproportionately. "It fits" and "it is economical" are different questions.
+- **Capacity is not attention.** A fact present at token 300,000 is not as reliably used as the same fact at token 3,000. This is the point the Common Pitfalls below make, and it does not go away as windows grow.
+
+Practical structure for long-document work, which is worth remembering as a shape rather than a rule: put the **documents first**, the **instructions last**, and ask for **grounding before conclusions** — have the model quote or locate the relevant passages, then reason from them. Long-context prompting guidance is one of the few places where prompt structure has a measurable, repeatable effect.
+
+The decision rule for a scenario: reach for a larger window when the task genuinely requires cross-document reasoning that chunking would break (a contract and its three amendments, a codebase-wide refactor plan). Reach for retrieval, chunking, or the map-then-reduce staging described earlier when the task is a lookup dressed up as a long document. Paying long-context prices to answer a question that lives in one paragraph is the context-window equivalent of running an Opus-class model to classify sentiment.
 
 ### Returning Users and Stale Data
 
@@ -981,6 +1283,63 @@ Hosts can expose dozens of MCP servers, and presenting all their tools at once w
 
 When designing an MCP server intended for a host with progressive availability, pay extra attention to descriptions and names: the agent may discover the tool through search, so the description must read well in isolation, not only when listed alongside its siblings.
 
+### An MCP Server in Code
+
+The abstractions become concrete quickly. A minimal Python server exposing one resource and two tools:
+
+```python
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("orders")
+
+@mcp.resource("orders://schema")
+def order_schema() -> str:
+    """Reference context: the shape of an order record. Read this before querying."""
+    return open("schema/order.json").read()
+
+@mcp.tool()
+def search_orders(query: str) -> dict:
+    """Search orders by customer email or order number. Returns order IDs and
+    distinguishing metadata. Use this before any refund tool so you act on an
+    unambiguous order_id rather than a name the customer typed."""
+    return {"results": db.search_orders(query)}
+
+@mcp.tool()
+def issue_refund(order_id: str, amount_cents: int) -> dict:
+    """Issue a refund against an order. Amounts above the account's policy limit
+    are held for manager approval rather than disbursed."""
+    limit = policy_service.refund_limit_for(order_id)   # server-controlled, not a parameter
+    if amount_cents > limit:
+        approval = approvals.create(order_id, amount_cents)
+        return {"status": "requires_approval", "approval_id": approval.id}
+    return {"status": "refunded", "receipt_id": payments.refund(order_id, amount_cents)}
+
+if __name__ == "__main__":
+    mcp.run(transport="stdio")
+```
+
+Every design principle from earlier sections is visible here, which is why this example is worth reading closely:
+
+- `orders://schema` is **static reference material**, so it is a resource. `search_orders` needs live data, so it is a tool. That is the whole resource-versus-tool decision rule, applied.
+- The tool descriptions say *when to use* and *when not to*, and `search_orders` explicitly sets up the lookup-then-act pattern for `issue_refund`.
+- The refund limit is read from a policy service, not accepted as a parameter. There is no `override=True` on the interface for a model — or an injected instruction — to set. This is threshold enforcement inside the tool, exactly as the Customer Service section describes.
+- Exceeding the limit returns a **structured, actionable result** (`requires_approval` with an ID), not a silent failure and not an exception.
+
+### MCP Authorization
+
+Local stdio servers inherit the trust and credentials of the process that launched them. Remote servers do not, and that is where authorization becomes a design question rather than a configuration detail.
+
+The MCP specification builds remote authorization on OAuth 2.1: the server advertises its authorization server, the client performs a standard authorization-code flow with PKCE, and the resulting access token accompanies subsequent requests. Practically, in a host like Claude Code this surfaces as a browser consent screen the first time a remote server is used, with tokens stored and refreshed by the host.
+
+What matters architecturally, in rough order of how often it decides a scenario:
+
+- **The token carries the user's authority, not the model's.** A remote MCP server acting on a delegated token can do exactly what that user can do. Over-broad scopes are how a summarization agent ends up holding write access to production, which is the first leg of the exfiltration triad in the Security section.
+- **Scope grants are the enforcement point.** "The agent should only read tickets" is a prompt instruction; a read-only scope on the issued token is a guarantee. Grant the narrowest scope the workflow needs, per server.
+- **Tokens are secrets with all the usual properties.** They must not appear in prompts, tool descriptions, tool results, or transcripts. The host holds them; the model never sees them.
+- **Authorization failures are protocol-level.** An expired or insufficient token is not a business outcome for the model to reason about — it is a condition for the host to resolve by re-authenticating. Surfacing it as a tool result invites the model to retry a call that cannot succeed.
+
+For servers you build: validate the token on every request, at the server, on the operation actually being performed. "The host already authenticated the user" is the MCP version of "the model already checked policy," and it fails for the same reason — the tool is inside the trust boundary and must validate.
+
 ### MCP in Claude Code
 
 Claude Code can configure MCP servers at several scopes. The scope determines where the configuration lives, who can see it, and which copy wins when names collide:
@@ -1199,6 +1558,52 @@ A few patterns work well in combination, and the exam tends to test the differen
 
 - **Threshold enforcement inside the tool.** The tool reads the threshold from a server-controlled source — feature flag, policy service, account record — not from a parameter the model passes. The model can call `issue_credit(amount=…)` but cannot raise the cap by setting `override=true`, because no such parameter exists on the public interface. If a model call exceeds the limit, the tool returns a structured "requires_approval" result, not a silent failure.
 - **Preview-then-execute with single-use tokens.** For high-impact actions (closing accounts, charging cards, sending external notifications), split the operation into two tools: a preview tool that returns a redacted summary plus a one-time execution token, and an execute tool that consumes that token. The model presents the preview to the user verbatim, the user confirms, and only then does the execute tool fire. The token is short-lived and bound to the previewed payload; the model cannot construct a token from scratch or reuse one with different parameters.
+
+  The pattern is usually described abstractly, but the guarantees come entirely from the token's lifecycle, so it is worth seeing:
+
+  ```python
+  import hmac, hashlib, json, secrets, time
+
+  SECRET = os.environ["CONFIRMATION_TOKEN_KEY"]   # server-side only
+  TTL_SECONDS = 300
+
+  def _bind(payload: dict) -> str:
+      """A token is a signature over the exact payload the user was shown."""
+      canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+      return hmac.new(SECRET.encode(), canonical.encode(), hashlib.sha256).hexdigest()
+
+  def preview_close_account(account_id: str) -> dict:
+      account = accounts.get(account_id)
+      payload = {
+          "account_id": account_id,
+          "issued_at": int(time.time()),
+          "nonce": secrets.token_urlsafe(16),
+      }
+      return {
+          "confirmation_token": f"{payload['nonce']}.{payload['issued_at']}.{_bind(payload)}",
+          "impact": {
+              "account_name": account.name,
+              "open_invoices": account.open_invoice_count,
+              "data_deleted_after_days": 30,
+              "reversible": False,
+          },
+      }
+
+  def execute_close_account(account_id: str, confirmation_token: str) -> dict:
+      nonce, issued_at, signature = confirmation_token.split(".")
+      payload = {"account_id": account_id, "issued_at": int(issued_at), "nonce": nonce}
+
+      if not hmac.compare_digest(signature, _bind(payload)):
+          return {"error": "token_does_not_match_previewed_action", "retryable": False}
+      if time.time() - int(issued_at) > TTL_SECONDS:
+          return {"error": "token_expired", "retryable": False, "next_step": "re-run preview"}
+      if not nonce_store.consume(nonce):        # atomic; second use fails
+          return {"error": "token_already_used", "retryable": False}
+
+      return {"status": "closed", "receipt_id": accounts.close(account_id)}
+  ```
+
+  Four properties do the work, and each blocks a specific failure mode. The signature **binds the token to the exact payload** — a token issued for account A cannot execute against account B, so a model that misremembers the target cannot act on the wrong one. The TTL means a token surfaced by an injected instruction earlier in a long session is dead by the time it could be replayed. The nonce store makes the token **single-use**, so a retry loop cannot double-execute. And because the signing key lives server-side, the model cannot fabricate a token however it is prompted. Compare this to a `dry_run: false` parameter, which the model can simply set — the difference is not diligence, it is that one design has no path to the unwanted outcome.
 - **Server-side authorization checks before any state change.** Even when the model is well-behaved, the tool should re-verify the caller's authority on every invocation. "The model already checked policy" is not a defense. Tools live inside the trust boundary; they must validate.
 
 Avoid letting prompt instructions ("never refund above $50 without manager approval") be the only line of defense. Adversarial users, prompt-injection in retrieved content, or a malformed tool description can all push the model past prose rules. Defense-in-depth means: prompt rules to bias the agent, tool implementations to enforce, and audit logs to detect.
@@ -1431,6 +1836,27 @@ How skills differ from the neighboring mechanisms:
 
 Prefer a skill over a slash command when the workflow should trigger from the nature of the task ("this is a database migration, load the migration procedure") rather than from an explicit human command. Prefer a slash command when invocation should remain a deliberate human act.
 
+**How a skill actually gets selected** is worth being precise about, because it determines how you write one. There is no separate retrieval or ranking system: each available skill's name and short description sit in context, and the model decides a skill is relevant the same way it decides a tool is relevant — by reading the description against the task at hand. The "progressive disclosure" is about the *body*, not the selection: the description is always loaded, the procedure is loaded only after selection.
+
+The practical consequence is that a skill description should be written like a **tool description, not like documentation**. It should say what the skill is for and when it applies, in terms that match how a task will be phrased, and it should distinguish itself from neighboring skills.
+
+```markdown
+---
+name: database-migration
+description: >-
+  Procedure for planning and executing schema migrations against the production
+  Postgres cluster. Use when adding, altering, or dropping columns or tables, or
+  when a change requires a backfill. Not for ORM model edits that do not touch
+  the schema, and not for read-only query work.
+---
+
+# Database migration procedure
+
+1. Confirm the change is expand-then-contract compatible...
+```
+
+A description that reads "Notes on our database practices" will not fire when someone asks to add a column, and no amount of detail in the body fixes that — the body was never loaded. If a skill is not triggering, the description is almost always the defect, exactly as with a tool the model keeps ignoring.
+
 ### Slash Commands
 
 Slash commands are reusable prompts. Use them for explicit workflows that developers invoke intentionally:
@@ -1482,6 +1908,109 @@ Two practical consequences:
 
 - **Don't assume the subagent "remembers" your project.** If the subagent needs the project's coding conventions, paste or reference them in the prompt. CLAUDE.md will not always be loaded into the subagent's context unless its definition does so.
 - **Don't expect a "second invocation" of the same subagent to continue where the first left off.** Each call is fresh. If state needs to persist across invocations, the parent persists it (in a file, in a structured note) and re-supplies the relevant slice with each call.
+
+### The Agent SDK in Code
+
+Everything above — built-in tools, hooks, subagents, sessions, permissions — is exposed programmatically. Seeing the options object makes the architecture explicit: each field is a decision about what this agent is allowed to do.
+
+```python
+import asyncio
+from claude_agent_sdk import query, ClaudeAgentOptions, AgentDefinition
+
+options = ClaudeAgentOptions(
+    system_prompt="You are a careful refactoring assistant for this repository.",
+    cwd="/srv/checkouts/payments",
+    allowed_tools=["Read", "Grep", "Glob", "Edit"],    # note: no Bash, no network
+    permission_mode="acceptEdits",
+    model="claude-sonnet-5",
+    agents={
+        "security-reviewer": AgentDefinition(
+            description=(
+                "Reviews a diff for security defects. Use for any change touching "
+                "authentication, payments, or user data handling."
+            ),
+            prompt=(
+                "You are a security reviewer. Report only injection, authorization "
+                "bypass, secret leakage, and unsafe deserialization. Ignore style."
+            ),
+            tools=["Read", "Grep"],                     # narrower than the parent
+            model="claude-opus-5",                      # more capable for the hard judgment
+        ),
+    },
+)
+
+async def main():
+    async for message in query(
+        prompt="Find every place we build SQL by string concatenation and fix it.",
+        options=options,
+    ):
+        print(message)
+
+asyncio.run(main())
+```
+
+Read `allowed_tools` as the capability surface and `agents` as the delegation surface. The subagent gets a *different, smaller* tool set and a *different, larger* model — the mixed-tier pattern from the Model Selection section and the restricted-privilege pattern from the Security section, both expressed as configuration rather than instruction.
+
+### Permission Modes and Programmatic Approval
+
+Permission modes set the default posture for tool calls. The distinction matters because it is the difference between an agent that asks and an agent that acts:
+
+| Mode | Behavior | When it fits |
+|---|---|---|
+| `default` | Prompts for permission on the first use of each tool | Interactive work with a human present |
+| `plan` | Read-only exploration; the agent proposes a plan and cannot edit | Broad or risky changes needing review before any write |
+| `acceptEdits` | File edits are auto-approved; other permission rules still apply | Trusted, scoped refactors where edit-by-edit approval is noise |
+| `bypassPermissions` | All permission prompts skipped | Sandboxed, disposable environments only — never against anything you cannot throw away |
+
+For anything more nuanced than a mode, the SDK provides a callback that runs before each tool call and returns a decision. This is the programmatic sibling of a `PreToolUse` hook, and it is where policy that depends on the *arguments* belongs:
+
+```python
+async def can_use_tool(tool_name: str, tool_input: dict, context):
+    if tool_name == "Edit" and "/migrations/" in tool_input.get("file_path", ""):
+        return {"behavior": "deny", "message": "Migrations are edited by hand, not by the agent."}
+    if tool_name == "Bash" and tool_input.get("command", "").startswith("git push"):
+        return {"behavior": "ask", "message": "Confirm push to remote?"}
+    return {"behavior": "allow", "updatedInput": tool_input}
+
+options = ClaudeAgentOptions(
+    allowed_tools=["Read", "Edit", "Bash"],
+    can_use_tool=can_use_tool,
+)
+```
+
+The guarantee is the same one that makes hooks the right place for hard rules: this function is *your code*, running before the tool does, with no path for the model to influence its verdict. `allowed_tools` decides which tools exist; `can_use_tool` decides whether a specific call is acceptable. Coarse capability, then fine-grained policy.
+
+### Headless and CI Execution
+
+Claude Code runs non-interactively, which is what makes it usable in pipelines, git hooks, and scheduled jobs:
+
+```bash
+# One-shot, plain text out
+claude -p "Summarize the changes in this PR and flag risky ones"
+
+# Machine-readable result for a CI step to parse
+claude -p "Review the staged diff for security defects" \
+  --output-format json \
+  --allowed-tools "Read,Grep,Glob" \
+  --permission-mode plan
+
+# Incremental events, for streaming progress into a build log
+claude -p "Run the test suite and fix failing tests" --output-format stream-json
+```
+
+Three design points that a scenario is more likely to test than the flags themselves:
+
+- **Non-interactive means no one is there to approve anything.** A pipeline that runs with `default` permissions will hang on the first prompt. This is precisely why `--allowed-tools` and an explicit permission mode are not optional in CI — the capability surface has to be decided in advance, in the pipeline definition, where it is reviewed like any other infrastructure change.
+- **`--output-format json` makes the result parseable**, so the pipeline can branch on findings rather than grepping prose. This is the same argument as structured outputs versus "respond only with JSON," one layer up.
+- **CI is an untrusted-content environment.** A pull request's diff, branch name, and commit messages are attacker-controlled in any repository accepting outside contributions. An agent reviewing them with write credentials has the full exfiltration triad from the Security section.
+
+### Plugins
+
+A plugin bundles skills, slash commands, subagents, hooks, and MCP server definitions into a single installable unit with its own manifest, distributed through a marketplace or a git repository.
+
+The reason it belongs in an architecture guide rather than a setup guide: plugins are the **distribution** answer to a problem the earlier mechanisms only solve locally. Skills, rules, and hooks configure one repository; a plugin packages a *capability* — a house code-review procedure, a deployment workflow with its enforcement hooks and its MCP server — so many repositories and many developers get the identical configuration without copying files between them.
+
+Two consequences follow directly. First, choose a plugin when the same workflow must exist in several repositories and stay in sync; choose plain project configuration when it belongs to one codebase. Second, a plugin can ship hooks and MCP servers, which means **installing one is granting code execution and tool access in your environment**. Vet plugins the way you vet dependencies and MCP servers — read what hooks it registers before installing, and prefer sources you control or trust. The supply-chain argument in the Security section applies here with no modification.
 
 ### Common Pitfalls
 
@@ -1552,6 +2081,47 @@ Evaluate by segment:
 
 Aggregate accuracy can be misleading. A pipeline that is 97% accurate overall may fail on a specific high-impact field or document type.
 
+#### Building the eval, concretely
+
+"Validate with evals, not vibes" is only actionable if you know what an eval is made of. The minimum viable version is a labeled set, a grader, and a segmented report — no framework required:
+
+```python
+import collections
+
+# 1. A labeled set. Sourced from production, deliberately stratified so rare-but-
+#    important segments are represented far above their natural frequency.
+cases = load_labeled_cases()   # [{"id", "document_type", "input", "expected": {...}}, ...]
+
+def grade(expected: dict, actual: dict) -> dict:
+    """Per-field exact match, so failures are attributable to a field, not a case."""
+    return {field: (actual.get(field) == value) for field, value in expected.items()}
+
+results = []
+for case in cases:
+    actual = run_extraction_pipeline(case["input"], model="claude-haiku-4-5-20251001")
+    results.append({"case": case, "field_scores": grade(case["expected"], actual)})
+
+# 2. Segment before you average — the whole point of the exercise.
+by_segment = collections.defaultdict(lambda: collections.defaultdict(list))
+for r in results:
+    for field, ok in r["field_scores"].items():
+        by_segment[r["case"]["document_type"]][field].append(ok)
+
+for doc_type, fields in by_segment.items():
+    for field, scores in fields.items():
+        print(f"{doc_type:20} {field:24} {sum(scores)/len(scores):.1%}  (n={len(scores)})")
+```
+
+What makes this useful rather than ceremonial:
+
+- **Grade per field, not per document.** A document-level pass/fail collapses exactly the information you need — which field is broken.
+- **Stratify the set deliberately.** If handwritten amendments are 2% of volume and 40% of your errors, a randomly sampled eval set will contain too few to measure. Over-sample them and weight later.
+- **Watch the `n` column.** A segment with 7 cases showing 71% accuracy is not distinguishable from one showing 86%; one more case flips it. Before declaring a model swap safe on a small segment, either collect more cases or say plainly that the segment is unmeasured — a small-sample difference is not a result.
+- **Compare candidates on the same set, same grader.** The value of the eval is comparative: this model versus that one, this prompt version versus the last. Absolute accuracy against a hand-built set means less than a controlled difference.
+- **Keep it in version control and run it in CI.** An eval that must be run by hand stops being run. This is the same argument as writing tests, and it fails the same way when ignored.
+
+The pairing with calibration matters too: an eval tells you *how often* the pipeline is right; calibration tells you whether the pipeline's own confidence score predicts that. You need both before confidence can gate automatic approval, which is why "tune the auto-approve threshold" is premature until the segment analysis is done.
+
 ### Common Pitfalls
 
 - **Asking for a full rewrite after a narrow failure.** Give the failing test and ask for a targeted fix.
@@ -1574,8 +2144,18 @@ The tiers, by family name:
 | Haiku | Fastest, cheapest | Classification, routing, simple extraction, high-volume low-complexity steps |
 | Sonnet | Balanced intelligence and speed | Default production workhorse for most agents and pipelines |
 | Opus | Most capable, highest cost | Complex agentic work, long-horizon planning, hard analysis and synthesis |
+| Above Opus (currently Mythos-class) | Frontier capability, highest cost, most restricted availability | The narrow set of problems where Opus measurably falls short; not a general-purpose default |
 
-Exact model versions, context windows, output limits, and prices change over time — and the lineup evolves, with newer top-end families periodically appearing above Opus. Consult the current models documentation (or query the Models API at runtime) rather than memorizing numbers. The architecture patterns are stable:
+The three-tier mental model is the durable one, but it is no longer the whole lineup: Anthropic has introduced a **frontier tier above Opus** — currently the Mythos class, including Claude Mythos 5 and the safety-restricted Claude Fable 5, with Claude Mythos Preview limited to selected organizations. If a scenario presents a workload where even the top general-availability tier underperforms, "escalate to a frontier-tier model" is a legitimate option; it is not a substitute for fixing an architecture that is over-tiered everywhere else.
+
+Exact model versions, context windows, output limits, and prices change over time — and the lineup evolves, with new families appearing at the top and older ones retiring. Consult the current models documentation (or query the Models API at runtime) rather than memorizing numbers:
+
+```python
+for model in client.models.list(limit=50).data:
+    print(model.id, model.display_name)
+```
+
+Querying at runtime is the architecture-level habit behind the advice: an application that hardcodes a model ID in fifty call sites has made a deprecation into a migration project, while one that resolves tier names (`"fast"`, `"default"`, `"escalation"`) to IDs through a single configuration layer changes one line. The architecture patterns are stable:
 
 - **Match the tier to the step, not to the product.** Pipelines are heterogeneous. A support automation might use a small model to classify intent, a mid-tier model to run the conversation, and reserve the top tier for escalated analysis. Paying top-tier prices for "classify this as positive or negative" is the model-selection equivalent of running a batch job against a real-time SLA.
 - **Route cheap-to-expensive.** A fast, cheap classifier in front of the pipeline can send most traffic to inexpensive handling and only the hard cases to a capable model. At volume, the router's cost is recovered many times over.
@@ -1592,6 +2172,53 @@ Architecture implications:
 - Reasoning depth is a cost and latency dial, not a binary. Higher effort means deeper reasoning, more thorough tool use, and more output tokens; lower effort means faster, terser, cheaper responses.
 - Spend reasoning where the task is reasoning-shaped: planning a migration, reconciling ambiguous requirements, debugging from indirect evidence. Mechanical extraction and classification rarely benefit — buy accuracy there with schemas and few-shot examples instead.
 - Effort is a per-request control. The same agent can run routine turns at moderate effort and raise it for a step flagged as hard. It is another allocation lever alongside model tier, caching, and batching.
+
+In the request, thinking mode and effort are two separate parameters that work together:
+
+```python
+response = client.messages.create(
+    model="claude-sonnet-5",
+    max_tokens=8000,                      # HARD ceiling on thinking + visible output
+    thinking={"type": "adaptive"},        # model decides whether and how deeply to think
+    output_config={"effort": "medium"},   # soft guidance: low | medium | high | max
+    messages=[{"role": "user", "content": task}],
+)
+
+for block in response.content:
+    if block.type == "thinking":
+        pass                              # a summary of the reasoning; keep it, do not edit it
+    elif block.type == "text":
+        print(block.text)
+```
+
+Four details that are easy to get wrong and are exactly the kind of thing an exam distinguishes:
+
+- **The levels are named**: `low`, `medium`, `high`, `max`, with `high` as the default — setting `high` explicitly is identical to omitting the parameter. Lower levels let the model skip thinking entirely on easy requests; higher levels make it think on most of them, at length.
+- **`effort` is guidance; `max_tokens` is a limit.** Effort influences how much work the model chooses to do; `max_tokens` caps thinking plus output together. High effort against a tight `max_tokens` is a recipe for `stop_reason: "max_tokens"` — the fix is to raise the ceiling or lower the effort, not to retry.
+- **`adaptive` is a thinking type, not an effort value.** `thinking={"type": "adaptive"}` and `output_config={"effort": ...}` are orthogonal; passing `"adaptive"` as an effort level is a category error. The older `thinking={"type": "enabled", "budget_tokens": N}` still functions on models that support it but is deprecated on current ones.
+- **Adaptive mode enables interleaved thinking**, meaning the model can reason *between* tool calls within a single turn rather than only before its first action. For agentic loops this is the substantive benefit — the model re-plans after seeing each tool result instead of committing to a plan formed before any evidence arrived.
+
+Interleaved thinking comes with one hard mechanical rule that breaks agent loops when violated: **thinking blocks must be passed back to the API unmodified.** When you append the assistant's turn to the conversation, include the `thinking` and `redacted_thinking` blocks exactly as received — same content, same order. Code that filters content blocks by type (keeping only `text` and `tool_use`), reorders them, or reconstructs them from stored text will be rejected. If you persist conversations to a database, store the blocks verbatim rather than a flattened representation you plan to rebuild.
+
+### Cost Mechanics
+
+Cost questions in this domain are rarely about the per-token price. They are about which token stream a design inflates. It is worth holding the full picture in one place:
+
+| Token stream | Billed as | Grows with |
+|---|---|---|
+| System prompt, tools, schemas | Input | Tool count and description length, output/tool schema size |
+| Conversation history | Input, **re-sent every turn** | Turn count — the compounding one |
+| Documents, images, retrieved context | Input | Attachment size and retrieval breadth |
+| Cache writes | Input at a premium | How often the cached prefix changes |
+| Cache reads | Input at a fraction of normal | Cache hit rate |
+| Thinking tokens | Output | Effort level and task difficulty |
+| Visible response | Output | `max_tokens`, verbosity instructions |
+
+Three consequences that decide most cost scenarios:
+
+- **History is the compounding term.** A 50-turn conversation re-sends turns 1–49 on turn 50. Halving the system prompt saves once per request; managing history changes the growth curve. This is why context management is a cost strategy, not only a quality strategy.
+- **Thinking bills as output, not input.** Raising effort raises the output bill on every request it affects, silently, without any change to the prompt. On a high-volume step, effort is a larger lever than prompt length.
+- **The levers do not substitute for each other.** Caching addresses a repeated prefix; batching addresses deferrable volume; tier selection addresses over-provisioned capability; trimming addresses bloated unique content. Applying the wrong one produces a rounding error and a confident report that the problem was addressed.
 
 ### Streaming
 
@@ -1730,6 +2357,46 @@ Batching is a poor fit when:
 
 Results may not be ordered like inputs, so `custom_id` is mandatory for reliable processing. The application matches each result back to its original request by `custom_id` — never by position. A duplicated or reused `custom_id` will make matching ambiguous; use stable, unique identifiers (often the source record's primary key) so re-running a partial batch is straightforward.
 
+Submission and reconciliation, in code — note that the interesting part is the failure branch, not the happy path:
+
+```python
+from anthropic.types.messages.batch_create_params import Request
+from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
+
+batch = client.messages.batches.create(
+    requests=[
+        Request(
+            custom_id=f"invoice-{record.id}",        # stable primary key, never positional
+            params=MessageCreateParamsNonStreaming(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=1500,
+                tools=[extract_invoice_tool],
+                tool_choice={"type": "tool", "name": "extract_invoice"},
+                messages=[{"role": "user", "content": record.text}],
+            ),
+        )
+        for record in pending_invoices
+    ]
+)
+
+# ... later, once batch.processing_status == "ended"
+retry_ids, chunk_ids = [], []
+for result in client.messages.batches.results(batch.id):
+    kind = result.result.type
+    if kind == "succeeded":
+        persist(result.custom_id, result.result.message)
+    elif kind == "errored":
+        error_type = result.result.error.type
+        if error_type == "invalid_request":
+            chunk_ids.append(result.custom_id)       # e.g. too long — split the input
+        else:
+            retry_ids.append(result.custom_id)       # transient — resubmit as-is
+    elif kind == "expired":
+        retry_ids.append(result.custom_id)           # never processed; safe to resubmit
+```
+
+The reconciliation loop is where batch designs succeed or fail. Results arrive in arbitrary order, so `custom_id` is the only join key; a failure in one request does not affect the others, so the response to a partial failure is a *smaller* follow-up batch, never a rerun of the whole job; and the error type determines the remedy, exactly as in the Error Handling section — a too-long input needs chunking, a transient failure needs resubmission, and an expired request was never processed at all.
+
 Operational details to know:
 
 - A batch has a processing status such as in progress, canceling, or ended.
@@ -1759,7 +2426,28 @@ Handle by failure type:
 
 ### Batch and Prompt Caching
 
-The batch discount and prompt caching (see the Prompt Caching section) can stack: batched requests support caching, so a shared prefix can be both cached and discounted — though cache hits inside an asynchronous batch are best-effort, since requests may process far apart in time. Neither lever fixes the other's limits. Caching does not make the context window larger or a batch return sooner, and the batch discount does not matter when a result is needed immediately. Match the lever to the actual constraint.
+The batch discount and prompt caching (see the Prompt Caching section) can stack: batched requests support caching, so a shared prefix can be both cached and discounted — though cache hits inside an asynchronous batch are best-effort.
+
+The reason is worth understanding rather than memorizing, because it points at the fix. Cache entries have a short default lifetime (five minutes). A batch is scheduled at the platform's convenience and may spread its requests over minutes or hours, so the entry written by the first request that renders the shared prefix can easily expire before the five-hundredth request in the same batch gets scheduled — every subsequent miss pays a fresh write premium rather than a cheap read.
+
+The practical mitigation is the **extended one-hour cache duration** for batch workloads with a large shared prefix. It costs more per write and buys a window long enough to cover realistic batch spread:
+
+```python
+params = MessageCreateParamsNonStreaming(
+    model="claude-haiku-4-5-20251001",
+    max_tokens=1500,
+    system=[{
+        "type": "text",
+        "text": EXTRACTION_GUIDE,                       # large, identical across the batch
+        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+    }],
+    messages=[{"role": "user", "content": record.text}],
+)
+```
+
+Even then, treat the hit rate as an empirical question — read the usage fields on returned results rather than assuming.
+
+Neither lever fixes the other's limits. Caching does not make the context window larger or a batch return sooner, and the batch discount does not matter when a result is needed immediately. Match the lever to the actual constraint.
 
 ### Common Pitfalls
 
@@ -1805,6 +2493,19 @@ Connecting an MCP server grants it a position of influence: its tool description
 - Apply data minimization to tool results. Returning 40 fields when 6 are needed (the compression guidance in the Context Management section) is also a security issue: every extra field of PII in context is another copy in logs and transcripts.
 - Logging and auditability are part of the security design: record tool calls with inputs, outcomes, and request IDs so incidents can be reconstructed.
 
+### Data Retention and Compliance Posture
+
+Where conversation data lives, and for how long, is a design parameter rather than a fixed property of the platform — and it is the question a regulated-industry scenario is usually really asking.
+
+The pieces that come up:
+
+- **Zero Data Retention (ZDR).** Available to organizations with the relevant agreement, ZDR means request and response content is not retained on the platform after the response is served. It interacts with features that *depend* on server-side persistence: anything that stores state between requests behaves differently or is unavailable under ZDR. The general principle — the API is stateless and your application owns history — becomes strictly true under ZDR, with no exceptions to lean on.
+- **Retention of derived artifacts.** Batch results remain retrievable for a bounded window (currently 29 days from creation), uploaded files persist until deleted, and cached prefixes live for their TTL. Each is a copy of your data on a clock you should know about and, where the data is sensitive, manage explicitly by deleting files and results when the pipeline is done with them.
+- **Your side is usually the larger exposure.** Transcripts in your database, prompts in your application logs, tool inputs in your observability platform, session files on developer laptops. A compliance review that stops at the model provider has audited the smaller half.
+- **Regional and deployment choices.** Running through a cloud provider's hosted offering changes which organization's data-handling terms and which region apply. That is a procurement and compliance decision with architectural consequences (feature availability, latency, model lineup), not merely a billing choice.
+
+The design habit that follows: **minimize before you retain.** Data that never enters the context cannot be retained by anyone. Redact identifiers in retrieved documents when the task does not need them, return the six fields the agent uses rather than all forty, and keep credentials at the execution layer. Every guideline above is easier to satisfy when there is less sensitive content in play to begin with.
+
 ### Common Pitfalls
 
 - **Relying on the system prompt to resist adversaries.** Prompts shape behavior; code enforces policy.
@@ -1826,6 +2527,11 @@ Connecting an MCP server grants it a position of influence: its tool description
 - Use tool use or strict tool use for schema-backed tool calls.
 - `tool_choice: auto` allows tools; `any` requires one; `tool` requires a named tool; `none` disables tools.
 - Assistant prefill is legacy — current models reject trailing assistant turns; use structured outputs or system-prompt style instructions instead.
+- `response.content` is a list of blocks (`text`, `tool_use`, `thinking`), not a string.
+- Images and PDFs go in `image` / `document` content blocks; place them before the instruction text. Images cost input tokens proportional to size.
+- The Files API trades base64 re-uploads for a reusable `file_id` — a transport and caching win, not a token-cost win.
+- Citations attach source spans to text blocks; they compete with JSON structured outputs for the same output channel, so carry provenance in your own schema for structured extraction.
+- Structured outputs compile a grammar: first use of a schema pays compile latency, compiled grammars are cached, and very complex schemas hit compilation limits.
 
 ### Tool Design
 
@@ -1870,6 +2576,7 @@ Connecting an MCP server grants it a position of influence: its tool description
 - Capture `detected_pattern` / `rule_id` for review-agent findings so dismissals become signal.
 - Calibrate confidence before automation.
 - Sample high-confidence outputs to catch hidden errors.
+- Grade evals per field, stratify the set toward rare-but-important segments, watch sample sizes per segment, and keep the eval in version control.
 
 ### Context Management
 
@@ -1883,6 +2590,9 @@ Connecting an MCP server grants it a position of influence: its tool description
 - Surface conflicts between user goals; do not average them.
 - Version prompts for long-lived conversations.
 - API-native compaction and context editing keep long sessions alive server-side; application-level state and summaries control exactly what survives.
+- Compaction and context editing are opt-in and threshold-driven: set a trigger, a retention floor, and a replacement policy. `model_context_window_exceeded` is the backstop, not the trigger.
+- Editing content inside a cached prefix invalidates it — cache the stable prefix, edit the volatile tail.
+- Large context windows cost full input tokens every turn, may price and rate-limit differently past a threshold, and do not make distant facts equally salient.
 
 ### System Prompts
 
@@ -1909,6 +2619,8 @@ Connecting an MCP server grants it a position of influence: its tool description
 - Project MCP config uses `.mcp.json` at the repo root; local and user Claude Code MCP config both live in `~/.claude.json` at different keys.
 - Same-name MCP servers resolve by scope precedence local > project > user; the winning definition is used whole, not merged.
 - Progressive availability and `list_changed` notifications keep large tool surfaces tractable.
+- Remote MCP servers authorize via OAuth 2.1; the token carries the *user's* authority, so scope grants — not prompts — are the enforcement point. Auth failures are host problems, not model problems.
+- Servers must validate authorization per request, per operation. "The host authenticated the user" is not a defense.
 
 ### Agentic Patterns
 
@@ -1948,6 +2660,11 @@ Connecting an MCP server grants it a position of influence: its tool description
 - Use slash commands for task-specific reusable workflows.
 - Hooks: `PreToolUse` (deny/allow/ask/defer/modify-input/inject-context), `PostToolUse`, `UserPromptSubmit`, `SessionStart`.
 - Subagents start fresh — they do not inherit the parent's conversation; the parent must include all needed context.
+- Permission modes: `default` (prompt), `plan` (read-only), `acceptEdits` (auto-approve edits), `bypassPermissions` (sandboxes only).
+- `allowed_tools` decides which tools exist; a `can_use_tool` callback (or `PreToolUse` hook) decides whether a specific call is allowed — coarse capability, then argument-level policy.
+- Headless: `claude -p` with `--output-format json|stream-json`; CI must pre-declare tools and permission mode because nobody is there to approve. PR content is untrusted input.
+- Skills are selected by the model reading the description, like a tool description — a vague description means the skill never loads.
+- Plugins bundle skills, commands, subagents, hooks, and MCP servers for distribution across repos; installing one grants code execution, so vet it like a dependency.
 
 ### Model Selection and Inference
 
@@ -1955,6 +2672,10 @@ Connecting an MCP server grants it a position of influence: its tool description
 - Route cheap-to-expensive; escalate on measurable signals (low calibrated confidence, failed validation), not by default.
 - Run subagents on cheaper models when subtasks are scoped.
 - Thinking is adaptive on current models; a request-level effort setting scales reasoning, tool use, and cost. Fixed thinking budgets are legacy.
+- Effort levels are `low`/`medium`/`high`/`max`, default `high`; `adaptive` is a thinking type, not an effort value. `max_tokens` is the hard cap on thinking plus output.
+- Adaptive mode enables interleaved thinking (reasoning between tool calls). Thinking blocks must be echoed back unmodified or the request is rejected.
+- The tier ladder extends above Opus (Mythos-class). Resolve model IDs through configuration or the Models API rather than hardcoding them.
+- Thinking tokens bill as output; conversation history is the compounding input term. Match the lever to the cost: prefix → cache, deferrable volume → batch, over-tiered → smaller model, bloated unique content → trim.
 - Stream when humans watch or outputs are long; skip it for batch and short machine-to-machine calls.
 - Branch on `stop_reason`: `max_tokens` = truncated output; `pause_turn` = re-send to resume; `refusal` and `model_context_window_exceeded` = do not retry unchanged.
 - SDKs auto-retry 429/5xx with backoff; honor `retry-after`; sustained 429s are a capacity-planning signal.
@@ -1979,6 +2700,8 @@ Connecting an MCP server grants it a position of influence: its tool description
 - Chunk context-length failures.
 - Batch cadence ≈ deadline − 24h batch window − processing buffer; submit periodically for tight SLAs.
 - Batch discount does not fix latency or context limits.
+- Batch results stay retrievable for a bounded window (currently 29 days); errors are per-request, so follow up with a smaller batch, never a rerun.
+- In-batch cache hits are best-effort because requests spread over time past the 5-minute default TTL — use the 1-hour cache duration for large shared prefixes.
 
 ### Security and Trust
 
@@ -1988,6 +2711,8 @@ Connecting an MCP server grants it a position of influence: its tool description
 - Private data + untrusted content + an outbound channel = an exfiltration path; remove or gate one leg.
 - Vet MCP servers and hooks like dependencies; annotations are unverified claims.
 - Keep secrets out of context — transcripts, logs, and resumed sessions persist them; inject credentials in tool code.
+- Retention is a design parameter: ZDR removes platform-side retention (and anything depending on server-side state), while batch results, uploaded files, and caches each persist on their own clock.
+- Minimize before you retain — data that never enters context cannot leak from anywhere.
 
 ---
 
@@ -1995,18 +2720,18 @@ Connecting an MCP server grants it a position of influence: its tool description
 
 ### Recommended Order
 
-1. API fundamentals: stateless requests, messages, system prompt, tool-use blocks.
+1. API fundamentals: stateless requests, messages, system prompt, tool-use blocks, multimodal content, the Files API.
 2. Tool design: descriptions, parameters, structured outputs, tool composition.
 3. Error handling: retry categories, uncertain state, MCP error tiers.
-4. Structured extraction: schemas, validation, provenance, review loops.
-5. Context management: summarization, state, retrieval, stale data.
+4. Structured extraction: schemas, validation, provenance, citations, review loops.
+5. Context management: summarization, state, retrieval, stale data, compaction and context editing, long-context economics.
 6. System prompts: salience, examples, principles, clarification.
-7. MCP: tools, resources, prompts, trust, configuration.
+7. MCP: tools, resources, prompts, trust, authorization, configuration scopes.
 8. Agentic patterns: decomposition, subagents, research provenance.
-9. Claude Code/Agent SDK: tools, plan mode, sessions, memory, hooks.
-10. Model selection and inference controls: tiers, thinking effort, streaming, stop reasons, rate limits.
-11. Cost levers and evaluation: prompt caching, batch processing, feedback, calibration.
-12. Security: trust boundaries, prompt injection, secrets, least privilege.
+9. Claude Code/Agent SDK: tools, plan mode, sessions, memory, skills, hooks, permission modes, headless execution, plugins.
+10. Model selection and inference controls: tiers, adaptive thinking and effort, interleaved thinking, streaming, stop reasons, rate limits.
+11. Cost levers and evaluation: prompt caching, batch processing, token-cost mechanics, eval construction, calibration.
+12. Security: trust boundaries, prompt injection, secrets, least privilege, data retention.
 
 ### How to Practice
 
@@ -2023,6 +2748,12 @@ For each topic, practice choosing between two plausible designs:
 - Prompt caching vs batch vs smaller model vs prompt trimming — which cost is actually being paid?
 - Frozen system prompt plus injected state vs rewriting the system prompt mid-session.
 - One large model everywhere vs a cheap router with tier escalation.
+- Native citations vs provenance fields carried in your own extraction schema.
+- Application-level summarization vs API-native compaction or context editing.
+- Larger context window vs retrieval and map-then-reduce staging.
+- `allowed_tools` restriction vs an argument-level approval callback or hook.
+- Higher effort vs a more capable model — which is actually short, reasoning depth or capability?
+- Project configuration vs a distributable plugin for a workflow several repos need.
 
 A strong answer explains why one design fits the scenario's constraints.
 
@@ -2040,6 +2771,8 @@ When faced with a scenario, identify:
 6. Does a human need raw transcript, structured handoff, or source citations?
 7. Are we optimizing for accuracy, cost, latency, safety, or developer workflow?
 8. Where does untrusted content enter the system, and what could it cause the agent to do?
+9. Which token stream does this design inflate — history, schemas, attachments, thinking, or output?
+10. Where does this data come to rest, and for how long, on both sides of the API boundary?
 
 ---
 
@@ -2235,6 +2968,10 @@ D. Log all outbound emails and audit them weekly.
 - [Context editing](https://platform.claude.com/docs/en/build-with-claude/context-editing) - Server-side clearing of stale tool results.
 - [Compaction](https://platform.claude.com/docs/en/build-with-claude/compaction) - Server-side summarization for long-running sessions.
 - [Token counting](https://platform.claude.com/docs/en/build-with-claude/token-counting) - Exact pre-request token counts for budgeting.
+- [Vision](https://platform.claude.com/docs/en/docs/build-with-claude/vision) - Image content blocks, sizing, and token cost.
+- [PDF support](https://platform.claude.com/docs/en/docs/build-with-claude/pdf-support) - Document blocks and how PDFs are processed.
+- [Files API](https://platform.claude.com/docs/en/docs/build-with-claude/files) - Upload once, reference by `file_id` across requests.
+- [Models API](https://platform.claude.com/docs/en/api/models-list) - Enumerating available models at runtime instead of hardcoding IDs.
 - [Code execution tool](https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool) - Server-side tool execution in a managed sandbox.
 - [Agent Skills](https://platform.claude.com/docs/en/agents-and-tools/skills) - Skill structure, `SKILL.md`, and progressive loading.
 - [Long context prompting tips](https://platform.claude.com/docs/en/docs/build-with-claude/prompt-engineering/long-context-tips) - Prompt structure for long documents and retrieval-heavy tasks.
@@ -2249,6 +2986,9 @@ D. Log all outbound emails and audit them weekly.
 - [Claude Code MCP](https://code.claude.com/docs/en/mcp) - MCP server scopes and configuration in Claude Code.
 - [Claude Agent SDK overview](https://code.claude.com/docs/en/sdk) - Programmable agents with built-in tools, hooks, sessions, MCP, and subagents.
 - [Claude Code subagents](https://code.claude.com/docs/en/sub-agents) - Subagent contexts, tool limits, and configuration.
+- [Agent SDK permissions](https://code.claude.com/docs/en/agent-sdk/permissions) - Permission modes and the programmatic tool-approval callback.
+- [Claude Code headless mode](https://code.claude.com/docs/en/headless) - `-p`, output formats, and automation in CI.
+- [Claude Code plugins](https://code.claude.com/docs/en/plugins) - Bundling skills, commands, hooks, and MCP servers for distribution.
 
 ### MCP Documentation
 
@@ -2257,6 +2997,7 @@ D. Log all outbound emails and audit them weekly.
 - [MCP tools specification](https://modelcontextprotocol.io/specification/2024-11-05/server/tools) - Tool discovery, calling, and error handling.
 - [MCP resources specification](https://modelcontextprotocol.io/specification/2025-06-18/server/resources) - Resources as context, URI handling, subscriptions, and resource errors.
 - [MCP Inspector](https://modelcontextprotocol.io/docs/tools) - Debugging MCP servers and validating tools/resources/prompts.
+- [MCP authorization specification](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization) - OAuth 2.1 flow, scopes, and token handling for remote servers.
 
 ### Anthropic Engineering and Courses
 
